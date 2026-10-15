@@ -64,6 +64,8 @@ export interface PrismCometPreloaderProps {
   quality?: number
   /** The faint compositing grid behind the load. Defaults to true. */
   grid?: boolean
+  /** Small twinkling stars behind the load. Visible while loading, fading out with the counter. Defaults to false. */
+  stars?: boolean
   /** The loading counter. Defaults to true. */
   hud?: boolean
   /** Film grain over the frame. Defaults to true. */
@@ -74,6 +76,12 @@ export interface PrismCometPreloaderProps {
   height?: string
   /** Fired once, after the camera has passed through the portal. */
   onComplete?: () => void
+  /**
+   * Hold the reveal instead of auto-entering: after the animation completes,
+   * wait for a click (or Enter/Space) before passing through the portal.
+   * Ignored while `loop` is set. Defaults to false.
+   */
+  waitForEnter?: boolean
   /** Extra root class names. */
   className?: string
 }
@@ -583,6 +591,46 @@ function usePrefersReducedMotion() {
   return reduced
 }
 
+// Deterministic starfield (fixed seed: identical on server and client, so no
+// hydration mismatch). Mostly tiny dots, a few larger glowing ones, tinted
+// from the active palette.
+function mulberry32(seed: number) {
+  return () => {
+    seed |= 0
+    seed = (seed + 0x6d2b79f5) | 0
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed)
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
+
+interface PcpStar {
+  left: number
+  top: number
+  size: number
+  dur: number
+  delay: number
+  peak: number
+  tint: string
+}
+
+function pcpStars(count = 90): PcpStar[] {
+  const rand = mulberry32(20261015)
+  return Array.from({ length: count }, () => {
+    const roll = rand()
+    return {
+      left: rand() * 100,
+      top: rand() * 100,
+      size: roll < 0.55 ? 1.5 : roll < 0.88 ? 2.5 : 4,
+      dur: 1.6 + rand() * 2.8,
+      delay: -(rand() * 4),
+      peak: 0.3 + rand() * 0.7,
+      tint:
+        rand() < 0.7 ? "#ffffff" : rand() < 0.66 ? "var(--pcp-cyan)" : "var(--pcp-gold)",
+    }
+  })
+}
+
 const PCP_CSS = `
 .pcp-root {
   position: relative;
@@ -671,6 +719,26 @@ const PCP_CSS = `
 }
 .pcp-root:not([data-phase="load"]) .pcp-grid { opacity: 0; }
 
+/* ---- twinkling stars: same beat as the grid — out with the counter ---- */
+.pcp-stars {
+  -webkit-mask-image: radial-gradient(ellipse at 50% 50%, #000 30%, transparent 88%);
+  mask-image: radial-gradient(ellipse at 50% 50%, #000 30%, transparent 88%);
+  transition: opacity 1.4s ease;
+}
+.pcp-root:not([data-phase="load"]) .pcp-stars { opacity: 0; }
+.pcp-star {
+  position: absolute;
+  border-radius: 9999px;
+  background: currentColor;
+  box-shadow: 0 0 5px 0 currentColor;
+  opacity: 0.15;
+  animation: pcp-twinkle var(--tw) ease-in-out var(--td) infinite;
+}
+@keyframes pcp-twinkle {
+  0%, 100% { opacity: 0.12; transform: scale(0.75); }
+  50% { opacity: var(--tp); transform: scale(1.15); }
+}
+
 /* ---- letterbox ---- */
 .pcp-bar {
   position: absolute;
@@ -705,7 +773,7 @@ const PCP_CSS = `
 .pcp-root:not([data-phase="load"]) .pcp-bl { opacity: 0; transform: translateY(1.2em); }
 .pcp-count {
   font-family: var(--pcp-display);
-  font-size: clamp(30px, calc(var(--pcp-u) * 0.13), 112px);
+  font-size: clamp(20px, calc(var(--pcp-u) * 0.06), 54px);
   font-weight: 300;
   line-height: 0.9;
   letter-spacing: -0.02em;
@@ -795,6 +863,7 @@ const PCP_CSS = `
   .pcp-root[data-phase="lift"] .pcp-title { transform: none; filter: none; }
   .pcp-bar, .pcp-bl, .pcp-fbstar { transition-duration: 0.01s; }
   .pcp-root[data-phase="lift"][data-hole="true"] .pcp-gate { transition-delay: 0s; }
+  .pcp-star { animation: none; opacity: 0.55; }
 }
 `
 
@@ -811,11 +880,13 @@ export default function PrismCometPreloader({
   speed = 1,
   quality = 0.6,
   grid = true,
+  stars = false,
   hud = true,
   grain = true,
   fontFamily = DISPLAY_STACK,
   height = "100svh",
   onComplete,
+  waitForEnter = false,
   className = "",
 }: PrismCometPreloaderProps) {
   const [phase, setPhase] = React.useState<Phase>("load")
@@ -826,6 +897,7 @@ export default function PrismCometPreloader({
   const [generation, setGeneration] = React.useState(0)
   const [box, setBox] = React.useState({ w: 1280, h: 800 })
   const still = usePrefersReducedMotion()
+  const field = React.useMemo(() => pcpStars(), [])
 
   const rootRef = React.useRef<HTMLDivElement>(null)
   const canvasRef = React.useRef<HTMLCanvasElement>(null)
@@ -1155,6 +1227,8 @@ export default function PrismCometPreloader({
       return () => clearTimeout(t)
     }
     if (phase === "reveal") {
+      // Gate mode: hold the finished portal until the visitor clicks / presses Enter.
+      if (waitForEnter && !loop) return
       const t = setTimeout(() => setPhase("lift"), HOLD_MS)
       return () => clearTimeout(t)
     }
@@ -1171,7 +1245,7 @@ export default function PrismCometPreloader({
       }, liftMs)
       return () => clearTimeout(t)
     }
-  }, [phase, loop, igniteMs, liftMs])
+  }, [phase, loop, igniteMs, liftMs, waitForEnter])
 
   const onActivate = () => {
     if (phase === "load") rushRef.current = true
@@ -1278,6 +1352,28 @@ export default function PrismCometPreloader({
           )}
           {grid ? (
             <div className="pcp-layer pcp-grid" aria-hidden="true" />
+          ) : null}
+          {stars ? (
+            <div className="pcp-layer pcp-stars" aria-hidden="true">
+              {field.map((s, i) => (
+                <i
+                  key={i}
+                  className="pcp-star"
+                  style={
+                    {
+                      left: s.left + "%",
+                      top: s.top + "%",
+                      width: s.size,
+                      height: s.size,
+                      color: s.tint,
+                      "--tw": s.dur + "s",
+                      "--td": s.delay + "s",
+                      "--tp": s.peak,
+                    } as React.CSSProperties
+                  }
+                />
+              ))}
+            </div>
           ) : null}
 
           <div
